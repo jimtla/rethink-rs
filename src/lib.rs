@@ -1,5 +1,8 @@
+//#![feature(custom_derive, plugin)]
+//#![plugin(serde_macros)]
+
+extern crate serde_json;
 extern crate byteorder;
-extern crate rustc_serialize;
 use byteorder::{ReadBytesExt, WriteBytesExt, LittleEndian};
 use std::io::prelude::*;
 use std::net::TcpStream;
@@ -9,8 +12,8 @@ use std::fmt;
 use std::io;
 use std::convert::From;
 
-use rustc_serialize::json;
-use rustc_serialize::json::Json;
+use std::collections::BTreeMap;
+use serde_json::Value;
 
 #[derive(Debug)]
 pub struct UnknownError {
@@ -47,24 +50,24 @@ wrapped_enum!{
     ConnectionError(String),
     /// Unknown Error
     UnknownError(UnknownError),
-    /// rustc_serialize json parsing error
-    JsonParse(rustc_serialize::json::ParserError),
+    /// serde json parsing error
+    JsonParse(serde_json::Error),
   }
 }
 
-    impl fmt::Display for Error {
-      fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-          Error::FromUtf8Error(ref error) => fmt::Display::fmt(error, f),
-          Error::Utf8Error(ref error) => fmt::Display::fmt(error, f),
-          Error::Io(ref error) => fmt::Display::fmt(error, f),
-          Error::Byteorder(ref error) => fmt::Display::fmt(error, f),
-          Error::ConnectionError(ref s) => fmt::Display::fmt(s, f),
-          Error::UnknownError(ref error) => fmt::Display::fmt(error, f),
-          Error::JsonParse(ref error) => fmt::Display::fmt(error, f),
-        }
-      }
+impl fmt::Display for Error {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match *self {
+      Error::FromUtf8Error(ref error) => fmt::Display::fmt(error, f),
+      Error::Utf8Error(ref error) => fmt::Display::fmt(error, f),
+      Error::Io(ref error) => fmt::Display::fmt(error, f),
+      Error::Byteorder(ref error) => fmt::Display::fmt(error, f),
+      Error::ConnectionError(ref s) => fmt::Display::fmt(s, f),
+      Error::UnknownError(ref error) => fmt::Display::fmt(error, f),
+      Error::JsonParse(ref error) => fmt::Display::fmt(error, f),
     }
+  }
+}
 
 
 fn read_string<T: Read>(r : &mut T) -> Result<String, Error> {
@@ -84,12 +87,14 @@ pub struct Connection {
 }
 
 impl Connection {
-  fn connect() -> Result<Connection, Error> {
+  pub fn connect() -> Result<Connection, Error> {
     let stream = try!(TcpStream::connect("127.0.0.1:28015"));
-    Ok(Connection{
+    let mut conn = Connection{
       stream: stream,
       query_count: 0,
-    })
+    };
+    try!(conn.handshake());
+    Ok(conn)
   }
 
   fn handshake(&mut self) -> Result<(), Error> {
@@ -106,7 +111,16 @@ impl Connection {
     }
   }
 
-  fn send(&mut self, raw_string : &str) -> Result<json::Json, Error> {
+  pub fn exec<Q:Reql>(&mut self, query: Q) -> Result<serde_json::Value, Error> {
+    let start = Value::Array(vec![Value::U64(1),
+                                  query.as_json(),
+                                  Value::Object(BTreeMap::new())]);
+    let raw_query = try!(serde_json::ser::to_string(&start));
+    println!("{:?}", raw_query);
+    self.send(&raw_query)
+  }
+
+  fn send(&mut self, raw_string : &str) -> Result<serde_json::Value, Error> {
     self.query_count += 1;
     try!(self.stream.write_u64::<LittleEndian>(self.query_count));
 
@@ -126,46 +140,133 @@ impl Connection {
 
     let resp_len = self.stream.read_u32::<LittleEndian>().unwrap();
     let mut resp_bytes = Read::by_ref(&mut self.stream).take(resp_len as u64);
-    json::Json::from_reader(&mut resp_bytes).map_err(Error::from)
+    serde_json::de::from_reader(&mut resp_bytes).map_err(Error::from)
   }
 }
 
 
 
 // 14
-struct Database {
+pub struct Database {
   name: String,
 }
 
-impl Reql for Database {
-  fn as_json(&self) -> Json {
-    vec![Json::U64(14), vec![Json::String(self.name)]].as_json()
+impl Database {
+  pub fn new<S: Into<String>>(database: S) -> Self {
+    Database{
+      name: database.into(),
+    }
+  }
+
+  pub fn table<S: Into<String>>(self, table: S) -> Table {
+    Table{
+      name: table.into(),
+      db: self,
+    }
   }
 }
 
+impl Reql for Database {
+  fn as_json(&self) -> Value {
+    Value::Array(vec![Value::U64(14),
+                      Value::Array(vec![Value::String(self.name.clone())])])
+  }
+
+}
+
+
 // 15
-struct Table {
+pub struct Table {
   name: String,
   db: Database,
 }
 
-trait Reql {
-  fn as_json(&self) -> json::Json;
+impl Table {
+  pub fn insert<O:Object>(self, object: O) -> Insert<O> {
+    Insert{
+      table: self,
+      obj: object,
+    }
+  }
 }
 
-trait Sequence {}
-trait Object {}
-
-struct Filter {
-  seq: Box<Sequence>,
-  obj: Box<Object>,
+impl Reql for Table {
+  fn as_json(&self) -> Value {
+    Value::Array(vec![Value::U64(15),
+                      Value::Array(vec![
+                        self.db.as_json(),
+                        Value::String(self.name.clone()),
+                      ]),
+                ])
+  }
 }
+
+impl Sequence for Table {}
+
+// 39 
+pub struct Filter<S:Sequence,O:Object> {
+  seq: S,
+  obj: O,
+}
+
+impl<S:Sequence, O:Object> Reql for Filter<S,O> {
+  fn as_json(&self) -> Value {
+    Value::Array(vec![Value::U64(39),
+                      Value::Array(vec![
+                        self.seq.as_json(),
+                        self.obj.as_json(),
+                      ]),
+                ])
+  }
+}
+
+// 56 
+pub struct Insert<O:Object> {
+  table: Table,
+  obj: O,
+}
+
+impl<O:Object> Reql for Insert<O> {
+  fn as_json(&self) -> Value {
+    Value::Array(vec![Value::U64(56),
+                      Value::Array(vec![
+                        self.table.as_json(),
+                        self.obj.as_json(),
+                      ]),
+                ])
+  }
+}
+
+pub trait Reql {
+  fn as_json(&self) -> Value;
+}
+
+pub trait Sequence : Reql {
+  fn filter<O:Object>(self, obj: O) -> Filter<Self,O> where Self: Sized {
+    Filter{
+      seq: self,
+      obj: obj,
+    }
+  }
+}
+
+pub trait Object : Reql {}
+
+impl Reql for Value {
+  fn as_json(&self) -> Value {
+    self.clone()
+  }
+}
+impl Object for Value {}
+
 
 #[test]
 fn it_works() {
+  let mut filter : BTreeMap<String, Value> = BTreeMap::new();
+  filter.insert("name".into(), Value::String("Michael".into()));
+  let query = Database::new("test").table("table").filter(Value::Object(filter));
 
   let mut conn = Connection::connect().unwrap();
-  conn.handshake().unwrap();
-  println!("{}", conn.send(r#"[1,[39,[[15,[[14,["blog"]],"users"]],{"name":"Michel"}]],{}]"#).unwrap());
+  println!("{:?}", conn.exec(query).unwrap());
   panic!("ASDF");
 }

@@ -1,3 +1,4 @@
 target
 Cargo.lock
 *.swp
+rethinkdb_data/
